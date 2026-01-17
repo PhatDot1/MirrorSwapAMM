@@ -1,0 +1,35 @@
+{
+  "_format": "hh-sol-artifact-1",
+  "contractName": "IL1Read",
+  "sourceName": "contracts/interfaces/IL1Read.sol",
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "uint32",
+          "name": "assetIndex",
+          "type": "uint32"
+        }
+      ],
+      "name": "perpOraclePrice",
+      "outputs": [
+        {
+          "internalType": "uint64",
+          "name": "price",
+          "type": "uint64"
+        },
+        {
+          "internalType": "uint64",
+          "name": "conf",
+          "type": "uint64"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "bytecode": "0x",
+  "deployedBytecode": "0x",
+  "linkReferences": {},
+  "deployedLinkReferences": {}
+}

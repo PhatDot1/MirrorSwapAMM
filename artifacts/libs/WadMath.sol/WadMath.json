@@ -1,0 +1,10 @@
+{
+  "_format": "hh-sol-artifact-1",
+  "contractName": "WadMath",
+  "sourceName": "contracts/libs/WadMath.sol",
+  "abi": [],
+  "bytecode": "0x60808060405234601757603a9081601d823930815050f35b600080fdfe600080fdfea264697066735822122018743c818746880b68fe4aaa78159500be41ad4b48d6a00a8dd534feff4c4ab264736f6c634300081c0033",
+  "deployedBytecode": "0x600080fdfea264697066735822122018743c818746880b68fe4aaa78159500be41ad4b48d6a00a8dd534feff4c4ab264736f6c634300081c0033",
+  "linkReferences": {},
+  "deployedLinkReferences": {}
+}

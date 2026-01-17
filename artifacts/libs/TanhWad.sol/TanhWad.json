@@ -1,0 +1,10 @@
+{
+  "_format": "hh-sol-artifact-1",
+  "contractName": "TanhWad",
+  "sourceName": "contracts/libs/TanhWad.sol",
+  "abi": [],
+  "bytecode": "0x60808060405234601757603a9081601d823930815050f35b600080fdfe600080fdfea2646970667358221220e80a03de31b3fc039c042966b5ce5afd7c127561370c76d5347553baac7f484764736f6c634300081c0033",
+  "deployedBytecode": "0x600080fdfea2646970667358221220e80a03de31b3fc039c042966b5ce5afd7c127561370c76d5347553baac7f484764736f6c634300081c0033",
+  "linkReferences": {},
+  "deployedLinkReferences": {}
+}
