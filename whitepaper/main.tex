@@ -142,9 +142,9 @@
 \noindent
 We present an automated market maker (AMM) for Hyperliquid that treats order books and pricing curves as dual descriptions of liquidity, connected by a structure-preserving map. The design exploits Hyperliquid's dual-venue architecture---HyperEVM smart contracts with synchronous access to HyperCore order book state---to build an AMM whose parameters adapt to real-time microstructure signals.
 
-The core contribution is a \emph{duality-preserving parameterization}: order book observables (depth, imbalance, volatility) map to curve parameters (curvature, spread) via transformations that preserve convexity and no-arbitrage structure. We derive the optimal pricing potential from LP profit maximization under adverse selection, showing that the $\tanh$-regularized quadratic form emerges from inventory boundary constraints. Analysis demonstrates that dynamic curvature response to order flow imbalance reduces adverse selection costs.
+The core contribution is a \emph{duality-preserving parameterization}: order book observables (depth, imbalance, volatility) map to curve parameters (curvature, spread) via transformations that preserve convexity and no-arbitrage structure. We derive the optimal pricing potential from LP profit maximization under adverse selection, showing that the $\tanh$-regularized quadratic form emerges from inventory boundary constraints. 
 
-The architecture comprises an AMM on HyperEVM with real-time parameter updates, discrete quote management on HyperCore via API wallets, and robust oracle design using standard statistical techniques. We provide complete specifications suitable for implementation.
+The architecture comprises an AMM on HyperEVM with real-time parameter updates and an \emph{instanton allocator} that triggers discrete regime transitions when market conditions justify moving capital between the continuous AMM surface and discrete order book execution. The allocator computes an action signal from inventory, oracle tier, and spread conditions, emitting rebalancing decisions when thresholds are exceeded.
 
 \end{abstract}
 
@@ -175,9 +175,10 @@ We propose treating the order book and AMM curve not as separate systems but as 
     \item Both descriptions should derive from a common \emph{generating function} (potential)
     \item The map between descriptions must \emph{preserve structure}---specifically, convexity and no-arbitrage conditions
     \item The natural coordinates differ: order books use discrete price levels; AMMs use continuous inventory
+    \item Transitions between regimes should occur via \emph{instanton-like jumps} when the action favors discrete over continuous evolution
 \end{enumerate}
 
-These constraints are not philosophical---they have algorithmic consequences. The requirement that the parameterization map preserves convexity imposes sign constraints on how order book signals affect curve parameters. The generating function structure ensures path-independent pricing.
+These constraints are not philosophical---they have algorithmic consequences. The requirement that the parameterization map preserves convexity imposes sign constraints on how order book signals affect curve parameters. The generating function structure ensures path-independent pricing. The instanton mechanism enables capital to switch between AMM and order book modes when conditions warrant.
 
 \subsection{Contributions}
 
@@ -186,14 +187,14 @@ These constraints are not philosophical---they have algorithmic consequences. Th
     
     \item \textbf{Optimal potential derivation}: We derive the LP-optimal pricing potential under adverse selection and inventory constraints, showing the $\tanh$-regularized quadratic form is not ad-hoc but emerges from the optimization (Section~\ref{sec:potential}).
     
-    \item \textbf{LP P\&L analysis}: Formal analysis showing dynamic curvature reduces adverse selection costs (Section~\ref{sec:pnl}).
+    \item \textbf{Instanton allocator}: A decision system that computes an action signal and triggers regime transitions between continuous AMM and discrete order book modes (Section~\ref{sec:allocation}).
     
-    \item \textbf{Complete specification}: Implementation-ready design for Hyperliquid, including oracle scheme, safety mechanisms, and component interfaces (Sections~\ref{sec:oracle}--\ref{sec:safety}).
+    \item \textbf{Complete implementation}: Deployed smart contracts demonstrating the architecture on a local test environment (Sections~\ref{sec:oracle}--\ref{sec:safety}).
 \end{enumerate}
 
 \subsection{Scope and Limitations}
 
-We develop a proof-of-concept architecture. The duality framework provides design guidance, not a theorem; the LP analysis uses stylized models; empirical validation is pending (Appendix~\ref{app:simulation}). We are explicit about what is derived versus engineered.
+We develop a proof-of-concept architecture deployed on a local Hardhat fork of HyperEVM. The duality framework provides design guidance, not a mathematical theorem; the LP analysis uses stylized models. The implementation demonstrates the core concepts with simplified components (mock oracle, basic yield vault). We are explicit about what is derived versus engineered.
 
 
 % ============================================================================
@@ -260,7 +261,7 @@ Consider two ways to describe liquidity for a trading pair:
 
 \textbf{Curve description}: A continuous function $P(q)$ specifying marginal price as a function of inventory $q$. This is \emph{geometric}---we describe a smooth surface.
 
-These appear different, but both encode the same economic object: a schedule of prices at which liquidity is available. The insight is that a \emph{principled map} should relate them.
+These appear different, but both encode the same economic object: a schedule of prices at which liquidity is available. The insight is that a \emph{principled map} should relate them, and that capital can transition between these representations when economically justified.
 
 \subsection{Structure Preservation}
 
@@ -288,12 +289,23 @@ Both descriptions should derive from a common object. For the AMM, this is the \
 
 The order book implicitly defines a potential via cumulative depth. The duality map relates the parameters of these potentials.
 
+\subsection{Instanton Transitions}
+
+In physics, an \emph{instanton} is a non-perturbative solution describing tunneling between classical vacua---a discrete jump when continuous evolution is energetically unfavorable. We borrow this concept:
+
+\begin{definition}[Instanton Regime Transition]
+A capital allocation is \emph{instanton-like} if it transitions discretely between AMM (continuous) and order book (discrete) modes when a computed action signal exceeds a threshold, rather than evolving parameters smoothly.
+\end{definition}
+
+This is not a claim about quantum field theory---it is a design metaphor. The action signal $S$ aggregates risk factors (inventory imbalance, oracle deviation, spread stress). When $S$ crosses a threshold, the system signals that capital should move from the continuous AMM surface to discrete order book quotes, or vice versa.
+
 \begin{keyinsight}
 The duality perspective is not merely philosophical. It generates:
 \begin{enumerate}
     \item Sign constraints on the parameterization map
     \item The requirement that prices derive from a potential (ensuring path-independence)
     \item A criterion for which order book statistics are relevant (those affecting the potential's shape)
+    \item A decision rule for when to transition between continuous and discrete liquidity modes
 \end{enumerate}
 \end{keyinsight}
 
@@ -459,6 +471,8 @@ The spread $s$ covers:
     \item Risk premium scaling with volatility and imbalance
 \end{itemize}
 
+In the implementation, spread is tiered based on oracle deviation (Section~\ref{sec:oracle}).
+
 \subsection{Swap Execution}
 \label{sec:swap}
 
@@ -467,22 +481,26 @@ A trader exchanging $\Delta X$ of base asset:
 \begin{enumerate}
     \item \textbf{Read state}: Current inventory $q_0$, parameters $\btheta$, live oracle $p_{\mathrm{live}}$.
     
-    \item \textbf{Validate oracle}: Check $|\log(p_{\mathrm{live}}/p_{\mathrm{ref}})| < \tau$. If violated, widen spread or revert (Section~\ref{sec:oracle}).
+    \item \textbf{Validate oracle}: Check deviation tier. Adjust spread based on tier (Section~\ref{sec:oracle}).
     
     \item \textbf{Compute output}: 
     \begin{align}
-        q_1 &= q_0 + \Delta X \\
-        \Delta Y &= \int_{q_0}^{q_1} P_{\mathrm{dir}}(q) \, dq
+        q_1 &= q_0 \pm \Delta X \\
+        \text{quote cost} &= \text{midPrice}(q_{\text{mid}}) \cdot \text{baseDelta} \cdot (1 \pm s_{\text{eff}})
     \end{align}
-    where $P_{\mathrm{dir}}$ is $P_{\mathrm{ask}}$ for buys, $P_{\mathrm{bid}}$ for sells.
+    where $q_{\text{mid}} = (q_0 + q_1)/2$ and $s_{\text{eff}}$ depends on oracle tier.
     
-    \item \textbf{Check slippage}: Verify $\Delta Y \geq \Delta Y_{\min}$ (user-specified).
+    \item \textbf{Check inventory cap}: Verify $|q_1| \leq q_{\max}$.
     
     \item \textbf{Execute}: Transfer assets, update $q \leftarrow q_1$.
 \end{enumerate}
 
+\begin{implementation}
+The implementation assumes both base and quote tokens use 18 decimals, allowing direct treatment of token amounts as WAD-scaled values. For tokens with different decimals, appropriate scaling would be required in the swap functions.
+\end{implementation}
+
 \begin{proposition}[Path Independence]
-The swap cost $F(q_1) - F(q_0)$ depends only on initial and final inventory, not on intermediate states or trade sequencing.
+The swap cost depends only on initial and final inventory, not on intermediate states or trade sequencing (up to the mid-point approximation used in the implementation).
 \end{proposition}
 
 
@@ -506,9 +524,14 @@ where $|dV_t|$ is absolute trade volume, $p^*_t$ is the ``true'' price, and the 
 
 \subsection{Adverse Selection with Informed Flow}
 
-\begin{assumption}[Informed Flow Model]
+\begin{assumption}[Stylized Flow Model]
 \label{ass:informed}
-Informed traders arrive with rate $\mu_I$ when $|I| > I_0$, knowing the direction of the next price move. Trade size is $\bar{q}$.
+For analysis purposes, we model flow as arriving in two types:
+\begin{itemize}
+    \item Uninformed: Random direction, elastic to spreads
+    \item Informed: Direction correlated with imbalance signal $I$, trade size $\bar{q}$
+\end{itemize}
+The actual implementation uses imbalance $I$ as a proxy for informed flow probability, without explicitly modeling arrival rates.
 \end{assumption}
 
 Under static curvature $\lambda_{\mathrm{static}}$:
@@ -568,96 +591,150 @@ We apply standard robust estimation techniques, focusing on their integration wi
 
 \paragraph{Pull (In-Transaction).} The AMM reads HyperCore oracle price $p_{\mathrm{live}}$ via Read precompiles during swap execution. This provides real-time safety validation.
 
-\paragraph{Push (Asynchronous).} A keeper computes and posts $p_{\mathrm{ref}}$ and $\btheta$ to the parameter contract. This enables complex off-chain computation without on-chain gas costs.
+\paragraph{Push (Asynchronous).} A keeper computes and posts $p_{\mathrm{ref}}$ and $\btheta$ to MirrorState. This enables complex off-chain computation without on-chain gas costs.
 
-\subsection{Robust Price Estimation}
+\begin{implementation}
+The current deployment uses a simplified oracle where the keeper directly sets $p_{\mathrm{ref}}$ with validation via the live oracle check during swaps. The full robust estimation pipeline described below would be implemented in the keeper's off-chain logic.
+\end{implementation}
 
-We use standard techniques from robust statistics \citep{hampel1986robust}:
+\subsection{Robust Price Estimation Approach}
+
+We apply standard robust estimation techniques adapted for the push-pull architecture:
 
 \begin{enumerate}
-    \item \textbf{Log returns}: $r_i = \log(p_i / p_{i-1})$
+    \item \textbf{Median-based filtering}: Use median rather than mean to reduce outlier sensitivity
     
-    \item \textbf{Robust location}: $m = \med(r_i)$
+    \item \textbf{MAD-based scaling}: $s_{\MAD} = 1.4826 \cdot \med(|r_i - m|)$ provides robust volatility estimate
     
-    \item \textbf{Robust scale}: $s_{\MAD} = 1.4826 \cdot \med(|r_i - m|)$
-    
-    \item \textbf{Winsorization}: $r_i' = \clip(r_i, m - k \cdot s_{\MAD}, m + k \cdot s_{\MAD})$ for $k \approx 4$
-    
-    \item \textbf{Smoothing}: $\hat{r}_t = \alpha r_t' + (1-\alpha)\hat{r}_{t-1}$
-    
-    \item \textbf{Reference price}: $p_{\mathrm{ref}} = p_{t-1} \exp(\hat{r}_t)$
+    \item \textbf{Winsorization}: Clip extreme returns before computing updates
 \end{enumerate}
 
-This provides a manipulation-resistant estimate that adapts to trends while rejecting outliers.
+These techniques provide manipulation-resistant estimates that adapt to trends while rejecting outliers.
 
-\subsection{In-Transaction Safety Gates}
+\subsection{Oracle Tier System}
 
-\begin{definition}[Oracle Deviation Response]
-Let $d = |\log(p_{\mathrm{live}}/p_{\mathrm{ref}})|$. The contract responds:
-\begin{itemize}
-    \item $d \leq \tau$: Normal execution
-    \item $\tau < d \leq 2\tau$: Widen spread by factor $(1 + d/\tau)$; cap trade size
-    \item $d > 2\tau$: Revert transaction
-\end{itemize}
+\begin{definition}[Oracle Deviation Tiers]
+Let $d = |p_{\mathrm{live}}/p_{\mathrm{ref}} - 1|$ (approximate deviation in WAD). The contract classifies oracle quality into tiers:
+\begin{align}
+    \text{Tier 0:} & \quad d < \tau_1 = 0.005 \text{ (0.5\%)} \\
+    \text{Tier 1:} & \quad \tau_1 \leq d < \tau_2 = 0.02 \text{ (2\%)} \\
+    \text{Tier 2:} & \quad \tau_2 \leq d < \tau_3 = 0.05 \text{ (5\%)} \\
+    \text{Tier 3:} & \quad d \geq \tau_3
+\end{align}
 \end{definition}
 
-Recommended: $\tau = 0.03$ (3\%) for liquid pairs.
+\begin{definition}[Spread Adjustment by Tier]
+The effective spread scales with tier:
+\begin{align}
+    s_{\text{eff}}(\text{tier}) = \begin{cases}
+        s_{\text{base}} & \text{tier } 0 \\
+        1.5 \cdot s_{\text{base}} & \text{tier } 1 \\
+        2 \cdot s_{\text{base}} & \text{tier } 2 \\
+        5 \cdot s_{\text{base}} & \text{tier } 3
+    \end{cases}
+\end{align}
+Trades revert if tier $\geq 3$ to prevent execution under critical oracle conditions.
+\end{definition}
 
 \subsection{Staleness Handling}
 
 If time since last push update exceeds $T_{\mathrm{stale}}$:
 \begin{itemize}
-    \item $T_{\mathrm{stale}} < \Delta t \leq T_{\mathrm{critical}}$: Progressively widen spreads
-    \item $\Delta t > T_{\mathrm{critical}}$: Pause trading
+    \item $T_{\mathrm{stale}} < \Delta t \leq T_{\mathrm{emergency}}$: Mark as stale, widen spreads
+    \item $\Delta t > T_{\mathrm{emergency}}$: Mark as emergency stale, trigger instanton transition
 \end{itemize}
 
-Recommended: $T_{\mathrm{stale}} = 60$s, $T_{\mathrm{critical}} = 300$s.
+Default: $T_{\mathrm{stale}} = 60$s, $T_{\mathrm{emergency}} = 120$s.
 
 
 % ============================================================================
-% SECTION 7: CAPITAL ALLOCATION
+% SECTION 7: CAPITAL ALLOCATION AND INSTANTON TRIGGER
 % ============================================================================
-\section{Capital Allocation}
+\section{Capital Allocation and Instanton Trigger}
 \label{sec:allocation}
 
-The system allocates capital between two active modes:
+The InstantonAllocator implements the regime-switching logic, deciding when capital should transition between AMM, order book, and yield modes.
 
-\subsection{AMM Mode}
+\subsection{The Action Signal}
 
-Capital held as reserves in the HyperEVM contract, providing continuous liquidity via the pricing curve. This is the default state for retail-accessible swaps.
-
-\subsection{Order Book Mode}
-
-Capital deployed as discrete limit orders on HyperCore via the keeper's API wallet. This enables:
+\begin{definition}[Action Signal $S$]
+The allocator computes a weighted action signal:
+\begin{equation}
+    S = \alpha \cdot \frac{|q|}{q_{\max}} + \beta \cdot \text{tierPenalty} + \gamma \cdot \mathbb{I}_{\text{emergencyStale}} + \zeta \cdot s_{\text{eff}}
+    \label{eq:action}
+\end{equation}
+where:
 \begin{itemize}
-    \item Tighter spreads for sophisticated flow
-    \item Directional positioning when imbalance is high
-    \item Fee capture on the native order book
+    \item $\alpha, \beta, \gamma, \zeta$ are calibrated weights (WAD-scaled)
+    \item $|q|/q_{\max}$ is the fractional inventory (WAD)
+    \item tierPenalty $\in [0, \text{maxTierPenalty}]$ based on oracle tier
+    \item $\mathbb{I}_{\text{emergencyStale}}$ is 1 if data is critically stale, 0 otherwise
+    \item $s_{\text{eff}}$ is the effective spread (WAD)
 \end{itemize}
+\end{definition}
 
-\subsection{Allocation Logic}
+The action signal aggregates risk factors into a single metric. High $S$ indicates stressed conditions where discrete execution may be preferable to continuous AMM operation.
 
-Weights $(w_{\mathrm{AMM}}, w_{\mathrm{OB}})$ depend on regime:
+\subsection{Regime Decision Logic}
 
-\begin{table}[H]
-\centering
-\begin{tabular}{@{}lcc@{}}
-\toprule
-Regime & $w_{\mathrm{AMM}}$ & $w_{\mathrm{OB}}$ \\
-\midrule
-Calm, balanced & 0.6 & 0.4 \\
-High volatility & 0.8 & 0.2 \\
-High imbalance & 0.5 & 0.5 \\
-\bottomrule
-\end{tabular}
-\caption{Example allocation by regime}
-\end{table}
+\begin{definition}[Venue Selection]
+Given action signal $S$ and thresholds $S_{\text{yield}} < S_{\text{ob}}$:
+\begin{align}
+    \text{Venue} = \begin{cases}
+        \text{AMM} & S < S_{\text{yield}} \\
+        \text{YIELD\_RECALL} & S_{\text{yield}} \leq S < S_{\text{ob}} \\
+        \text{ORDERBOOK} & S \geq S_{\text{ob}} \text{ or tier} \geq 2 \text{ or emergencyStale}
+    \end{cases}
+\end{align}
+\end{definition}
 
-The allocation is rule-based and interpretable, not ML-driven.
+Default thresholds: $S_{\text{yield}} = 3$ WAD, $S_{\text{ob}} = 5$ WAD.
 
-\subsection{Future Extension: Yield Deployment}
+\subsection{Instanton Execution}
 
-Idle capital not needed for immediate liquidity could be deployed to yield strategies (lending, structured products). This is architecturally supported but out of scope for the current specification. See Appendix~\ref{app:yield} for interface design.
+\paragraph{AMM Mode (Default).} Capital remains in the AMM contract. The allocator deposits half of idle quote balance into the yield vault, maintaining liquidity for continuous swaps.
+
+\paragraph{YIELD\_RECALL Mode.} When $S$ exceeds $S_{\text{yield}}$, the allocator withdraws capital from yield back to the AMM to increase liquidity buffer.
+
+\paragraph{ORDERBOOK Mode (Instanton Transition).} When $S \geq S_{\text{ob}}$ or critical conditions occur (tier $\geq 2$, emergency staleness), the system signals a discrete transition:
+
+\begin{implementation}
+The allocator emits a \texttt{QuoteIntent} event specifying:
+\begin{itemize}
+    \item Direction: Buy base if $q < 0$, sell base if $q > 0$ (inventory reduction)
+    \item Amount: $\min(|q|, \text{cap})$ where cap $= 5$ base units (WAD)
+    \item Limit price: $p_{\mathrm{ref}}$ (current reference price)
+\end{itemize}
+This is an \emph{intent signal}---the keeper would execute via API wallet on HyperCore. Full integration with order placement is future work.
+\end{implementation}
+
+\begin{keyinsight}
+The instanton mechanism is a \emph{discrete jump} between regimes. Rather than smoothly adjusting AMM parameters as conditions worsen, the system triggers a qualitative change: move capital from the continuous pricing surface to discrete order book execution. This is the implementation of the duality perspective---switching between the two representations when the action favors it.
+\end{keyinsight}
+
+\subsection{Action Weights and Calibration}
+
+Default weights (all WAD-scaled):
+\begin{align}
+    \alpha &= 2 \cdot 10^{18} \quad \text{(inventory sensitivity)} \\
+    \beta  &= 2 \cdot 10^{18} \quad \text{(tier sensitivity)} \\
+    \gamma &= 10 \cdot 10^{18} \quad \text{(staleness penalty)} \\
+    \zeta  &= 2 \cdot 10^{18} \quad \text{(spread sensitivity)}
+\end{align}
+
+The large $\gamma$ ensures emergency staleness immediately triggers orderbook mode.
+
+\subsection{Yield Module (Simplified)}
+
+\begin{implementation}
+The YieldVaultMock provides a minimal yield interface:
+\begin{itemize}
+    \item Deposits: 1:1 share minting
+    \item Withdrawals: Proportional share burning
+    \item Yield: Adjustable rate multiplier (default 1.0)
+\end{itemize}
+This demonstrates the architecture. Production deployment would integrate with actual yield protocols (lending, structured products, etc.).
+\end{implementation}
 
 
 % ============================================================================
@@ -670,26 +747,26 @@ Idle capital not needed for immediate liquidity could be deployed to yield strat
 
 \begin{itemize}
     \item \textbf{Admin}: Pause/unpause, role assignment, emergency withdrawal
-    \item \textbf{Strategist}: Parameter updates within bounds, rebalancing triggers
-    \item \textbf{Keeper}: Oracle updates, order book execution
+    \item \textbf{Strategist}: Parameter updates within bounds, threshold configuration
+    \item \textbf{Keeper}: Oracle updates, instanton trigger execution
 \end{itemize}
 
 \subsection{Parameter Bounds}
 
-Strategist updates are constrained:
+MirrorState enforces strict bounds on keeper-pushed parameters:
 \begin{align}
-    \lambda &\in [\lambda_{\min}, \lambda_{\max}] = [0.005, 0.5] \\
-    s &\in [s_{\min}, s_{\max}] = [5\text{bp}, 500\text{bp}] \\
-    |\Delta\lambda|, |\Delta s| &\leq \Delta_{\max} \text{ per update}
+    \lambda &\in [0.001, 0.1] \text{ (WAD)} \\
+    s &\in [0.0005, 0.05] \text{ (WAD)} \\
+    \text{update age} &< 30 \text{s (freshness requirement)}
 \end{align}
 
 \subsection{Circuit Breakers}
 
 Trading pauses automatically when:
 \begin{itemize}
-    \item Oracle deviation $> 3\tau$
-    \item Data staleness $> T_{\mathrm{critical}}$
-    \item Inventory $|q| > 1.5 \cdot q_{\max}$
+    \item Oracle tier $\geq 3$ (deviation $> 5\%$)
+    \item Emergency staleness ($\Delta t > 120$s)
+    \item Inventory exceeds $q_{\max}$ (implementation check)
     \item Admin-triggered emergency
 \end{itemize}
 
@@ -698,8 +775,8 @@ Trading pauses automatically when:
 \begin{itemize}
     \item Reentrancy guards on all state-changing functions
     \item Push oracle bounded by rate limits and magnitude caps
-    \item Pull oracle cross-validates push data
-    \item Multi-sig or timelock for keeper key rotation
+    \item Pull oracle cross-validates push data via tier system
+    \item Role-based access control for parameter updates
 \end{itemize}
 
 
@@ -715,19 +792,27 @@ Trading pauses automatically when:
 
 \paragraph{Adverse Selection Mitigation.} Dynamic curvature responding to order flow signals provides theoretical (Section~\ref{sec:pnl}) and intuitive improvements over static AMMs.
 
-\paragraph{Capital Efficiency.} Dual-mode operation (AMM + order book) allows capital to serve different flow types optimally.
+\paragraph{Regime Switching.} The instanton allocator enables intelligent capital deployment---continuous AMM for normal flow, discrete orders for stressed conditions.
 
-\paragraph{Robust Oracle.} Layered safety (push/pull, winsorization, deviation gates) provides defense in depth against manipulation.
+\paragraph{Robust Oracle.} Layered safety (push/pull, tier system, staleness checks) provides defense in depth against manipulation.
 
 \subsection{Limitations}
 
 \paragraph{Parameterization is Engineered.} The duality framework provides constraints and intuition, not derivations. Optimal coefficients require empirical calibration.
 
-\paragraph{Keeper Centralization.} Current design uses a permissioned keeper. Decentralization (keeper networks, on-chain computation) is future work.
+\paragraph{Intent-Based Order Book.} Current implementation emits orderbook intents rather than executing them. Full integration with HyperCore order placement via API wallets is future work.
+
+\paragraph{Keeper Centralization.} Design uses a permissioned keeper. Decentralization (keeper networks, on-chain computation) is future work.
 
 \paragraph{Model Simplifications.} The LP analysis uses stylized models. Real markets have more complex informed/uninformed dynamics.
 
-\paragraph{Untested.} No production deployment or extensive backtesting. The system should be considered experimental.
+\paragraph{Demonstration System.} Key simplifications in current deployment:
+\begin{itemize}
+    \item Mock L1Read oracle (assumes 1e8 $\to$ 1e18 scaling)
+    \item Simplified yield vault (1:1 shares, linear rate)
+    \item Event-based rather than executed order book integration
+    \item No automated keeper (manual parameter updates)
+\end{itemize}
 
 \subsection{Comparison with Existing AMMs}
 
@@ -739,8 +824,8 @@ Feature & Uniswap v2 & Uniswap v3 & Curve & This Work \\
 \midrule
 Dynamic fees & & & & \checkmark \\
 Order book awareness & & & & \checkmark \\
-Concentrated liquidity & & \checkmark & \checkmark & \checkmark \\
-On-chain order book & & & & \checkmark \\
+Regime switching & & & & \checkmark \\
+Instanton transitions & & & & \checkmark \\
 \bottomrule
 \end{tabular}
 \caption{Feature comparison}
@@ -753,16 +838,16 @@ On-chain order book & & & & \checkmark \\
 \section{Conclusion}
 \label{sec:conclusion}
 
-We presented an AMM architecture for Hyperliquid based on treating order books and pricing curves as dual descriptions of liquidity. The duality perspective generates structure-preserving constraints on the parameterization map, ensuring economic coherence.
+We presented an AMM architecture for Hyperliquid based on treating order books and pricing curves as dual descriptions of liquidity. The duality perspective generates structure-preserving constraints on the parameterization map, ensuring economic coherence. The instanton allocator implements regime-switching logic, triggering discrete transitions between continuous AMM and discrete order book modes when conditions warrant.
 
 Key technical contributions include:
 \begin{itemize}
     \item Derivation of the optimal pricing potential under LP profit maximization with inventory constraints
-    \item Analysis showing dynamic curvature reduces adverse selection costs
-    \item Complete specification for Hyperliquid implementation
+    \item An action-signal-based decision system for regime transitions
+    \item Complete implementation demonstrating the architecture on a local test environment
 \end{itemize}
 
-The framework provides a principled approach to hybrid AMM/order-book systems. Empirical validation and production deployment remain future work.
+The framework provides a principled approach to hybrid AMM/order-book systems. Production deployment would require integration with Hyperliquid's official oracle precompiles, automated keeper infrastructure, and security audits.
 
 
 % ============================================================================
@@ -895,106 +980,135 @@ Base spread & $s_0$ & 10--50 bp & Minimum spread \\
 Spread vol sensitivity & $\beta_\sigma$ & 0.5--2 & Spread per unit $\sigma$ \\
 Spread imbalance sens. & $\beta_I$ & 0.01--0.05 & Spread at max imbalance \\
 Saturation scale & $\eta$ & 0.1--1 & Inventory scale for $\tanh$ \\
-Depth band & $\delta$ & 0.5--2\% & Order book observation range \\
+Action weight $\alpha$ & -- & 1--5 & Inventory penalty weight \\
+Action weight $\beta$ & -- & 1--5 & Tier penalty weight \\
+Action weight $\gamma$ & -- & 5--20 & Staleness penalty weight \\
+Action weight $\zeta$ & -- & 1--5 & Spread penalty weight \\
 \bottomrule
 \end{tabular}
 \caption{Calibration parameter ranges}
 \end{table}
 
 
-\section{Implementation Reference}
+\section{Implementation Status and Contract Interfaces}
 \label{app:implementation}
 
-Complete smart contract code and keeper implementation are provided in the accompanying repository. This appendix describes interfaces only.
+\subsection{Deployment Status}
+
+The system has been implemented and deployed on a local Hardhat fork of HyperEVM with the following components:
+
+\begin{itemize}
+    \item \textbf{Core contracts}: MirrorAMM, MirrorState, InstantonAllocator deployed and tested
+    \item \textbf{Mock infrastructure}: MockERC20 (18-decimal tokens), MockL1Read (oracle), YieldVaultMock
+    \item \textbf{Safety mechanisms}: Oracle deviation tiers, staleness checks, inventory caps operational
+    \item \textbf{Mathematical libraries}: WadMath and TanhWad implementing WAD-scale fixed-point arithmetic
+\end{itemize}
+
+Production deployment would require:
+\begin{enumerate}
+    \item Integration with Hyperliquid's official L1Read precompile (currently mocked with 1e8 $\to$ 1e18 scaling)
+    \item Keeper infrastructure for parameter updates and order book management
+    \item Calibration of safety parameters based on live market conditions
+    \item Security audits of all contracts
+\end{enumerate}
 
 \subsection{MirrorState Interface}
 
-Stores oracle data and curve parameters.
+Stores oracle data and curve parameters with tiered deviation tracking.
 
 \begin{verbatim}
-interface IMirrorState {
-    function updateParams(
-        uint256 pRef, 
-        uint256 lambda, 
-        uint256 s
-    ) external;  // keeper only
-    
-    function getParams() external view returns (
-        uint256 pRef, 
-        uint256 lambda, 
-        uint256 s,
-        uint256 lastUpdate
-    );
-    
-    function isStale() external view returns (bool);
+struct Theta {
+    int256 c;        // ln(pRef) in WAD
+    int256 lambda;   // WAD curvature
+    int256 s;        // WAD spread
 }
+
+struct OracleUpdate {
+    int256 pRef;
+    Theta theta;
+    int256 sigma;
+    int256 imbalance;
+    uint256 timestamp;
+}
+
+function pushUpdate(OracleUpdate calldata u) external; // KEEPER_ROLE
+
+function oracleTier() external view returns (
+    int256 deviation, 
+    uint8 tier,          // 0-3
+    bool isStale,        // > 60s
+    bool emergencyStale  // > 120s
+);
+
+function getMarketState() external view returns (MarketState memory);
 \end{verbatim}
 
 \subsection{MirrorAMM Interface}
 
-Executes swaps with potential-based pricing.
+Executes swaps with potential-based pricing and tier-adjusted spreads.
 
 \begin{verbatim}
-interface IMirrorAMM {
-    function swap(
-        uint256 amountIn,
-        uint256 minOut,
-        bool isBuy
-    ) external returns (uint256 amountOut);
-    
-    function quote(
-        uint256 amountIn,
-        bool isBuy
-    ) external view returns (uint256 amountOut);
-    
-    function getInventory() external view returns (int256);
-}
+function quoteForBaseDelta(bool isBuyBase, int256 baseDeltaWad) 
+    external view returns (int256 quoteDeltaWad);
+
+function swapBuyBaseExactOut(uint256 baseOut) 
+    external returns (uint256 quoteIn);
+
+function swapSellBaseExactIn(uint256 baseIn) 
+    external returns (uint256 quoteOut);
+
+// Pricing uses midPrice(qMid) where qMid = (q0 + q1)/2
+// Spread scales with oracle tier (see Section 6.3)
 \end{verbatim}
 
-\subsection{Keeper Specification}
+\subsection{InstantonAllocator Interface}
 
-The keeper:
-\begin{enumerate}
-    \item Subscribes to HyperCore WebSocket for order book updates
-    \item Computes observables $(p_0, D, I, \sigma)$ per Definition~\ref{def:observables}
-    \item Applies parameterization map (Definition~\ref{def:map})
-    \item Posts to MirrorState when update conditions are met
-    \item Manages API wallet for order book quotes
-\end{enumerate}
+Computes action signal and emits regime decisions.
 
-See repository for implementation.
+\begin{verbatim}
+function computeActionWad(
+    int256 qWad,
+    int256 qMaxWad,
+    uint8 tier,
+    bool emergencyStale,
+    int256 sEffWad
+) external view returns (int256 SWad);
+
+function trigger() external; // KEEPER_ROLE
+
+// Emits:
+// - InstantonDecision(venue, S, q, tier, emergencyStale, pRef, sEff)
+// - RebalanceIntent(venue, quoteAmount) for AMM/YIELD_RECALL
+// - QuoteIntent(isBuyBase, baseAmount, limitPrice) for ORDERBOOK
+\end{verbatim}
 
 
-\section{Yield Module Interface}
+\section{Yield Module Design}
 \label{app:yield}
 
-For future extension, the yield module interface:
+The YieldVaultMock provides a minimal interface for future extension:
 
 \begin{verbatim}
-interface IYieldModule {
-    function deposit(uint256 amount) external;
-    function withdraw(uint256 amount) external returns (uint256);
-    function available() external view returns (uint256);
-    function totalValue() external view returns (uint256);
-}
+function depositFor(address user, uint256 amount) 
+    external returns (uint256 mintedShares);
+
+function withdrawTo(address user, address to, uint256 amount) 
+    external returns (uint256 burnedShares);
+
+function totalUnderlyingFor(address user) 
+    external view returns (uint256);
+
+function setRate(int256 rateWad) external; // Admin adjusts yield
 \end{verbatim}
 
-The allocation logic would treat this as a third mode with weight $w_{\mathrm{yield}} = 1 - w_{\mathrm{AMM}} - w_{\mathrm{OB}}$.
+Current implementation uses 1:1 share minting with an adjustable rate multiplier. Production deployment would integrate with:
+\begin{itemize}
+    \item Lending protocols (Aave-style)
+    \item Structured products
+    \item Native HyperCore yield mechanisms (if available)
+\end{itemize}
 
-
-\section{Simulation Results (Pending)}
-\label{app:simulation}
-
-Empirical validation via backtesting is in progress. Planned experiments:
-
-\begin{enumerate}
-    \item \textbf{Adverse selection comparison}: Static vs dynamic $\lambda$ on historical order flow
-    \item \textbf{LP P\&L attribution}: Decomposition per Equation~\eqref{eq:pnl}
-    \item \textbf{Parameter sensitivity}: Varying $(\alpha_\sigma, \alpha_I, \alpha_D)$
-    \item \textbf{Oracle robustness}: Performance under simulated manipulation
-\end{enumerate}
-
-Results will be added upon completion.
+The allocation logic treats this as a third mode with weight $w_{\text{yield}} = 1 - w_{\text{AMM}} - w_{\text{OB}}$.
 
 
 \end{document}
