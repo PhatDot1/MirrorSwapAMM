@@ -14,7 +14,7 @@ contract MirrorAMM is ReentrancyGuard {
     IERC20 public immutable quote;
     MirrorState public immutable mirror;
 
-    // inventory coordinate q in base units, WAD-scaled
+    // inventory coordinate q in base units, WAD-scaled (18 decimals)
     int256 public qWad;
 
     int256 public etaWad = 50e18;
@@ -41,7 +41,6 @@ contract MirrorAMM is ReentrancyGuard {
 
     /// @notice delta(q) = lambda*q + tanh(q/eta)  in WAD
     function deltaWad(int256 _qWad) public view returns (int256) {
-        // mirror.theta() getter returns (c, lambda, s) as a tuple, not a struct
         (, int256 lambdaWad, ) = mirror.theta();
 
         int256 termLin = WadMath.mulWad(lambdaWad, _qWad);
@@ -66,6 +65,7 @@ contract MirrorAMM is ReentrancyGuard {
         return sBase * 5;
     }
 
+    /// @notice baseDeltaWad is ALWAYS positive magnitude (18 decimals)
     function quoteForBaseDelta(bool isBuyBase, int256 baseDeltaWad) public view returns (int256 quoteDeltaWad) {
         require(baseDeltaWad > 0, "baseDelta=0");
         require(baseDeltaWad <= maxTradeBaseWad, "trade too big");
@@ -74,7 +74,6 @@ contract MirrorAMM is ReentrancyGuard {
         require(!emergencyStale, "oracle emergency stale");
         require(tier < 3, "oracle deviation critical");
 
-        // mirror.theta() getter returns (c, lambda, s)
         (, , int256 sBaseWad) = mirror.theta();
         int256 sEff = _spreadWadFromTier(sBaseWad, tier);
 
@@ -82,7 +81,6 @@ contract MirrorAMM is ReentrancyGuard {
         int256 q1 = isBuyBase ? (q0 - baseDeltaWad) : (q0 + baseDeltaWad);
         require(q1 <= qMaxWad && q1 >= -qMaxWad, "inventory cap");
 
-        // midpoint price approximation across q0->q1
         int256 qMid = (q0 + q1) / 2;
         int256 pMid = midPriceWad(qMid);
 
@@ -96,10 +94,13 @@ contract MirrorAMM is ReentrancyGuard {
     }
 
     function swapBuyBaseExactOut(uint256 baseOut) external nonReentrant returns (uint256 quoteIn) {
-        int256 baseDeltaWad = int256(baseOut) * 1e18;
-        int256 qd = quoteForBaseDelta(true, baseDeltaWad);
+        // baseOut is already in 18-decimal token units; treat it as WAD directly
+        require(baseOut <= uint256(type(int256).max), "baseOut overflow");
+        int256 baseDeltaWad = int256(baseOut);
 
+        int256 qd = quoteForBaseDelta(true, baseDeltaWad);
         quoteIn = uint256(qd / 1e18);
+
         require(quote.transferFrom(msg.sender, address(this), quoteIn), "quote in fail");
         require(base.transfer(msg.sender, baseOut), "base out fail");
 
@@ -108,10 +109,13 @@ contract MirrorAMM is ReentrancyGuard {
     }
 
     function swapSellBaseExactIn(uint256 baseIn) external nonReentrant returns (uint256 quoteOut) {
-        int256 baseDeltaWad = int256(baseIn) * 1e18;
-        int256 qd = quoteForBaseDelta(false, baseDeltaWad);
+        // baseIn is already in 18-decimal token units; treat it as WAD directly
+        require(baseIn <= uint256(type(int256).max), "baseIn overflow");
+        int256 baseDeltaWad = int256(baseIn);
 
+        int256 qd = quoteForBaseDelta(false, baseDeltaWad);
         quoteOut = uint256(qd / 1e18);
+
         require(base.transferFrom(msg.sender, address(this), baseIn), "base in fail");
         require(quote.transfer(msg.sender, quoteOut), "quote out fail");
 
