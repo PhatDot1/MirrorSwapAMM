@@ -17,8 +17,6 @@ When conditions cross defined thresholds—inventory limits, volatility spikes, 
 
 **That dual description + discrete jumps is what we call "Mirror Symmetry + Instantons."**
 
-No physics required.
-
 ---
 
 ## What This Is

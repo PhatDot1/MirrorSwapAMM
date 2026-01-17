@@ -2,205 +2,200 @@
 pragma solidity ^0.8.20;
 
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+
+import {IERC20} from "./interfaces/IERC20.sol";
 import {MirrorState} from "./MirrorState.sol";
-import {MirrorAMM} from "./MirrorAMM.sol";
-import {WadMath} from "./libs/WadMath.sol";
+import {YieldVaultMock} from "./YieldVaultMock.sol";
 
-contract InstantonAllocator is AccessControl {
-    using WadMath for int256;
-
-    bytes32 public constant STRATEGIST_ROLE = keccak256("STRATEGIST_ROLE");
+contract InstantonAllocator is AccessControl, ReentrancyGuard {
     bytes32 public constant KEEPER_ROLE = keccak256("KEEPER_ROLE");
 
-    MirrorState public mirror;
-    MirrorAMM public amm;
-
-    struct Weights {
-        uint256 wAMM;   // 1e18
-        uint256 wOB;    // 1e18
-        uint256 wYield; // 1e18
+    enum Venue {
+        AMM,
+        ORDERBOOK,
+        YIELD_RECALL
     }
 
-    // Current "accounted" weights (MVP: updated by keeper after off-chain execution)
-    Weights public current;
+    IERC20 public immutable base;
+    IERC20 public immutable quote;
+    MirrorState public immutable mirror;
+    address public immutable amm;
+    YieldVaultMock public immutable yieldVault;
 
-    // Policy knobs
-    uint256 public rebalanceCooldown = 30; // seconds
-    uint256 public lastRebalance;
+    // Weights (WAD)
+    int256 public alphaWad = 2e18;
+    int256 public betaWad  = 2e18;
+    int256 public gammaWad = 10e18;
+    int256 public zetaWad  = 2e18;
 
-    uint256 public epsW = 0.05e18;  // 5% drift threshold
-    int256 public S_thresh = 0.15e18;
+    // Thresholds (WAD)
+    int256 public SOrderbookWad = 5e18;
+    int256 public SYieldRecallWad = 3e18;
 
-    // Action weights (alpha)
-    int256 public aOB = 0.6e18;
-    int256 public aY  = 0.4e18;
-    int256 public aTier = 0.4e18;
-    int256 public aInv  = 0.3e18;
+    uint256 public recallQuoteWad = 2000e18;
+    int256 public maxTierPenaltyWad = 3e18;
 
-    // Sigma thresholds
-    int256 public sigmaHigh = 0.05e18;
-    int256 public sigmaLow  = 0.015e18;
-
-    event RebalanceIntent(
-        uint256 wAMM,
-        uint256 wOB,
-        uint256 wYield,
-        int256 actionScore,
-        uint8 oracleTier,
-        bool stale,
+    event InstantonDecision(
+        Venue venue,
+        int256 SWad,
+        int256 qWad,
+        uint8 tier,
         bool emergencyStale,
-        int256 sigma,
-        int256 imbalance,
-        int256 qWad
+        int256 pRefWad,
+        int256 sEffWad
     );
 
-    event QuoteIntent(
-        int256 pRef,
-        int256 bidBpsWad,   // WAD (0.001e18 = 10 bps)
-        int256 askBpsWad,
-        uint256 sizeBaseHint,
-        bool skewToReduceInventory
-    );
+    event RebalanceIntent(Venue venue, uint256 quoteAmountWad);
+    event QuoteIntent(bool isBuyBase, uint256 baseAmountWad, uint256 limitPriceWad);
 
-    constructor(address admin, address _mirror, address _amm) {
-        _grantRole(DEFAULT_ADMIN_ROLE, admin);
-        _grantRole(STRATEGIST_ROLE, admin);
-        _grantRole(KEEPER_ROLE, admin);
+    constructor(
+        address _amm,
+        address _mirror,
+        address _base,
+        address _quote,
+        address _yieldVault,
+        address admin
+    ) {
+        amm = _amm;
         mirror = MirrorState(_mirror);
-        amm = MirrorAMM(_amm);
+        base = IERC20(_base);
+        quote = IERC20(_quote);
+        yieldVault = YieldVaultMock(_yieldVault);
 
-        current = Weights({wAMM: 0.55e18, wOB: 0.25e18, wYield: 0.20e18});
-        lastRebalance = block.timestamp;
+        _grantRole(DEFAULT_ADMIN_ROLE, admin);
+        _grantRole(KEEPER_ROLE, admin);
     }
 
-    // -------- strategist setters --------
-
-    function setCooldown(uint256 cd) external onlyRole(STRATEGIST_ROLE) {
-        rebalanceCooldown = cd;
-    }
-
-    function setThresholds(uint256 _epsW, int256 _S) external onlyRole(STRATEGIST_ROLE) {
-        epsW = _epsW;
-        S_thresh = _S;
-    }
-
-    function setSigmas(int256 low, int256 high) external onlyRole(STRATEGIST_ROLE) {
-        require(low > 0 && high > low, "bad sigma");
-        sigmaLow = low; sigmaHigh = high;
-    }
-
-    function setActionWeights(int256 _aOB, int256 _aY, int256 _aTier, int256 _aInv) external onlyRole(STRATEGIST_ROLE) {
-        aOB = _aOB; aY = _aY; aTier = _aTier; aInv = _aInv;
-    }
-
-    // Keeper updates current weights after executing off-chain moves (MVP accounting)
-    function setCurrentWeights(Weights calldata w) external onlyRole(KEEPER_ROLE) {
-        require(w.wAMM + w.wOB + w.wYield == 1e18, "sum != 1");
-        current = w;
-    }
-
-    // -------- core logic --------
-
-    function computeTarget() public view returns (Weights memory target, bool skewToReduceInventory) {
-        MirrorState.MarketState memory ms = mirror.getMarketState();
-        int256 q = amm.qWad();
-
-        // baseline
-        uint256 wOB = 0.25e18;
-        uint256 wAMM = 0.55e18;
-
-        // stressed regime => less OB, more AMM
-        if (ms.sigma > sigmaHigh || ms.tier >= 2 || ms.stale) {
-            wOB = 0.08e18;
-            wAMM = 0.70e18;
-        }
-        // calm regime => more OB
-        else if (ms.sigma < sigmaLow) {
-            wOB = 0.35e18;
-            wAMM = 0.45e18;
-        }
-
-        // strong imbalance => reduce OB
-        if (ms.imbalance.abs() > 0.5e18) {
-            if (wOB > 0.10e18) wOB = 0.10e18;
-            if (wAMM < 0.60e18) wAMM = 0.60e18;
-        }
-
-        uint256 wYield = 1e18 - wOB - wAMM;
-
-        // inventory skew preference
-        int256 qAbs = q.abs();
-        int256 qMax = amm.qMaxWad();
-        skewToReduceInventory = (qMax > 0) && ((qAbs * 1e18) / qMax > 0.4e18);
-
-        target = Weights({wAMM: wAMM, wOB: wOB, wYield: wYield});
-    }
-
-    function actionScore(Weights memory target)
-        public
-        view
-        returns (int256 S, MirrorState.MarketState memory ms, int256 q)
+    function setWeights(int256 _alphaWad, int256 _betaWad, int256 _gammaWad, int256 _zetaWad)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
     {
-        ms = mirror.getMarketState();
-        q = amm.qWad();
+        alphaWad = _alphaWad;
+        betaWad  = _betaWad;
+        gammaWad = _gammaWad;
+        zetaWad  = _zetaWad;
+    }
 
-        int256 dOB = int256(target.wOB) - int256(current.wOB);
-        int256 dY  = int256(target.wYield) - int256(current.wYield);
+    function setThresholds(int256 _SOrderbookWad, int256 _SYieldRecallWad) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        SOrderbookWad = _SOrderbookWad;
+        SYieldRecallWad = _SYieldRecallWad;
+    }
 
-        int256 termOB = aOB.mulWad(dOB.abs());
-        int256 termY  = aY.mulWad(dY.abs());
+    function setRecallAmount(uint256 _recallQuoteWad) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        recallQuoteWad = _recallQuoteWad;
+    }
 
-        int256 tierTerm = 0;
-        if (ms.tier >= 2) tierTerm = aTier;
+    function _abs(int256 x) internal pure returns (int256) {
+        return x >= 0 ? x : -x;
+    }
 
-        int256 invTerm = 0;
-        int256 qMax = amm.qMaxWad();
-        if (qMax > 0) {
-            invTerm = aInv.mulWad(q.abs().divWad(qMax));
+    function _spreadWadFromTier(int256 sBaseWad, uint8 tier) internal pure returns (int256) {
+        if (tier == 0) return sBaseWad;
+        if (tier == 1) return sBaseWad + sBaseWad / 2;
+        if (tier == 2) return sBaseWad * 2;
+        return sBaseWad * 5;
+    }
+
+    function computeActionWad(
+        int256 qWad,
+        int256 qMaxWad,
+        uint8 tier,
+        bool emergencyStale,
+        int256 sEffWad
+    ) public view returns (int256 SWad) {
+        // qFrac = |q|/qMax in WAD
+        int256 qFrac = int256(0);
+        if (qMaxWad > 0) {
+            qFrac = (_abs(qWad) * int256(1e18)) / qMaxWad;
         }
 
-        S = termOB + termY + tierTerm + invTerm;
+        // tierPenalty in WAD: tier 0..2 -> [0, maxTierPenalty]
+        int256 tierPenalty = int256(0);
+        if (tier >= 2) {
+            tierPenalty = maxTierPenaltyWad;
+        } else {
+            tierPenalty = (int256(uint256(tier)) * maxTierPenaltyWad) / int256(2);
+        }
+
+        int256 stalePenalty = emergencyStale ? int256(1e18) : int256(0);
+
+        SWad =
+            (alphaWad * qFrac) / int256(1e18) +
+            (betaWad  * tierPenalty) / int256(1e18) +
+            (gammaWad * stalePenalty) / int256(1e18) +
+            (zetaWad  * sEffWad) / int256(1e18);
     }
 
-    function shouldInstanton(Weights memory target) public view returns (bool ok, int256 S) {
-        (S,,) = actionScore(target);
+    function trigger() external nonReentrant onlyRole(KEEPER_ROLE) {
+        (, uint8 tier,, bool emergencyStale) = mirror.oracleTier();
+        (, , int256 sBaseWad) = mirror.theta();
+        int256 sEffWad = _spreadWadFromTier(sBaseWad, tier);
 
-        int256 driftOB = (int256(target.wOB) - int256(current.wOB)).abs();
-        int256 driftY  = (int256(target.wYield) - int256(current.wYield)).abs();
+        int256 qWad = _readInt256(amm, "qWad()");
+        int256 qMaxWad = _readInt256(amm, "qMaxWad()");
+        int256 pRefWad = mirror.pRef();
 
-        bool drift = (driftOB > int256(epsW)) || (driftY > int256(epsW));
-        bool cooldownOk = (block.timestamp - lastRebalance) >= rebalanceCooldown;
+        int256 SWad = computeActionWad(qWad, qMaxWad, tier, emergencyStale, sEffWad);
 
-        ok = cooldownOk && (S > S_thresh || drift);
+        Venue venue = Venue.AMM;
+        if (emergencyStale || tier >= 2 || SWad >= SOrderbookWad) {
+            venue = Venue.ORDERBOOK;
+        } else if (SWad >= SYieldRecallWad) {
+            venue = Venue.YIELD_RECALL;
+        }
+
+        emit InstantonDecision(venue, SWad, qWad, tier, emergencyStale, pRefWad, sEffWad);
+
+        if (venue == Venue.ORDERBOOK) {
+            bool isBuyBase = qWad < 0;
+
+            int256 absQ = _abs(qWad);
+            int256 cap = int256(5e18); // 5 base
+            int256 amtI = absQ > cap ? cap : absQ;
+
+            uint256 baseAmountWad = uint256(amtI);
+            uint256 limitPriceWad = uint256(pRefWad);
+
+            emit QuoteIntent(isBuyBase, baseAmountWad, limitPriceWad);
+            emit RebalanceIntent(venue, 0);
+            return;
+        }
+
+        if (venue == Venue.YIELD_RECALL) {
+            uint256 amount = recallQuoteWad;
+            uint256 available = yieldVault.totalUnderlyingFor(address(this));
+            if (amount > available) amount = available;
+
+            if (amount > 0) {
+                yieldVault.withdrawTo(address(this), address(this), amount);
+                emit RebalanceIntent(venue, amount);
+            } else {
+                emit RebalanceIntent(venue, 0);
+            }
+            return;
+        }
+
+        // AMM regime: deposit half allocator quote into yield
+        uint256 idle = quote.balanceOf(address(this));
+        if (idle > 0) {
+            uint256 amt = idle / 2;
+            quote.approve(address(yieldVault), amt);
+            yieldVault.depositFor(address(this), amt);
+            emit RebalanceIntent(venue, amt);
+        } else {
+            emit RebalanceIntent(venue, 0);
+        }
     }
 
-    /// @notice Emits intents if instanton triggers. Keeper runs this in a loop.
-    function trigger() external onlyRole(KEEPER_ROLE) {
-        (Weights memory target, bool skew) = computeTarget();
-        (bool ok, int256 S) = shouldInstanton(target);
-        if (!ok) return;
+    function seedQuote(uint256 amountWad) external nonReentrant {
+        require(amountWad > 0, "amount=0");
+        require(quote.transferFrom(msg.sender, address(this), amountWad), "transferFrom fail");
+    }
 
-        ( , MirrorState.MarketState memory ms, int256 q) = actionScore(target);
-        lastRebalance = block.timestamp;
-
-        emit RebalanceIntent(
-            target.wAMM, target.wOB, target.wYield,
-            S,
-            ms.tier,
-            ms.stale,
-            ms.emergencyStale,
-            ms.sigma,
-            ms.imbalance,
-            q
-        );
-
-        // Quote intent for OB keeper (bps heuristic)
-        int256 baseBps = 0.002e18; // 20 bps
-        if (ms.sigma > sigmaHigh) baseBps = 0.006e18; // 60 bps
-        if (ms.tier == 2) baseBps = baseBps + 0.004e18;
-
-        uint256 sizeBaseHint = (target.wOB * 1e3) / 1e18; // simple hint
-
-        emit QuoteIntent(ms.pRef, baseBps, baseBps, sizeBaseHint, skew);
+    function _readInt256(address target, string memory sig) internal view returns (int256 out) {
+        (bool ok, bytes memory data) = target.staticcall(abi.encodeWithSignature(sig));
+        require(ok && data.length >= 32, "read fail");
+        out = abi.decode(data, (int256));
     }
 }

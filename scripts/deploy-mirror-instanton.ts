@@ -1,174 +1,242 @@
-import hre, { ethers } from "hardhat";
+import { ethers, artifacts, network } from "hardhat";
+import fs from "fs";
 
-/**
- * Natural log for a JS number, scaled to 1e18 (WAD).
- * Good enough for MVP / demo parameters.
- */
-function lnWad(x: number): bigint {
-  if (!(x > 0)) throw new Error("lnWad expects x > 0");
-  const scaled = Math.floor(Math.log(x) * 1e18);
-  return BigInt(scaled);
+type Addr = string;
+
+function ensureDir(p: string) {
+  if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+
+function writeDeployments(obj: any) {
+  ensureDir("deployments");
+  const path = `deployments/${network.name}.json`;
+  fs.writeFileSync(path, JSON.stringify(obj, null, 2));
+  console.log("Wrote:", path);
+}
+
+function parseJsonArrayEnv(name: string): any[] | null {
+  const v = process.env[name];
+  if (!v) return null;
+  try {
+    const parsed = JSON.parse(v);
+    if (!Array.isArray(parsed)) throw new Error(`${name} must be a JSON array`);
+    return parsed;
+  } catch (e: any) {
+    throw new Error(`Failed to parse ${name}. Expected JSON array. Got: ${v}\n${e.message}`);
+  }
+}
+
+async function deployFromArtifact(name: string, args: any[]) {
+  const artifact = await artifacts.readArtifact(name);
+  const [deployer] = await ethers.getSigners();
+  const factory = new ethers.ContractFactory(artifact.abi, artifact.bytecode, deployer);
+  const contract = await factory.deploy(...args);
+  await contract.waitForDeployment();
+  return contract;
+}
+
+function constructorInputsFromAbi(abi: any[]): { name: string; type: string }[] {
+  const ctor = abi.find((x) => x.type === "constructor");
+  return ctor?.inputs ?? [];
+}
+
+function printMirrorCtorHelp(inputs: { name: string; type: string }[], l1read: string, deployer: string) {
+  console.log("\n=== MirrorState constructor inputs (from ABI) ===");
+  inputs.forEach((i, idx) => console.log(`  [${idx}] ${i.name || "(unnamed)"} : ${i.type}`));
+
+  // Provide a “best effort” template the user can edit.
+  // We'll fill obvious addresses.
+  const template = inputs.map((i) => {
+    if (i.type === "address") return "$L1READ"; // user can replace some with deployer if needed
+    if (i.type.startsWith("uint") || i.type.startsWith("int")) return 3600;
+    if (i.type === "bool") return false;
+    if (i.type === "bytes32") return "0x" + "00".repeat(32);
+    if (i.type.startsWith("bytes")) return "0x";
+    return null;
+  });
+
+  console.log("\nSet this env var (edit values as needed):");
+  console.log(
+    `export MIRRORSTATE_CTOR_ARGS='${JSON.stringify(template)}'`
+  );
+  console.log(`Then replace "$L1READ" placeholders with the right addresses. Commonly:`);
+  console.log(`- oracle/precompile address -> "$L1READ" (${l1read})`);
+  console.log(`- admin/owner -> "${deployer}"`);
+  console.log("");
 }
 
 async function main() {
-  const signers = await ethers.getSigners();
-  if (!signers || signers.length === 0) {
-    throw new Error(
-      "No signers available. If deploying to hyperevm, set DEPLOYER_PK in .env. " +
-        "If deploying to a local node, run with --network localhost."
-    );
-  }
-  const deployer = signers[0];
-
-  const net = await ethers.provider.getNetwork();
-  console.log("Network:", hre.network.name);
+  console.log("Network:", network.name);
+  const [deployer] = await ethers.getSigners();
+  const chainId = Number((await deployer.provider!.getNetwork()).chainId);
   console.log("Deployer:", deployer.address);
-  console.log("ChainId:", net.chainId.toString());
+  console.log("ChainId:", chainId);
 
-  const isLocal = hre.network.name === "localhost" || hre.network.name === "hardhat";
+  const isLocal = network.name === "localhost" || network.name === "hardhat";
 
-  // ---------- 1) L1Read ----------
-  let l1readAddr: string;
-  const assetIndex = Number(process.env.ASSET_INDEX ?? "0");
-
-  if (isLocal) {
-    const MockL1Read = await ethers.getContractFactory("MockL1Read");
-    const mock = await MockL1Read.deploy();
-    await mock.waitForDeployment();
-    l1readAddr = await mock.getAddress();
-
-    // price=100.00 in 1e8 (100 * 1e8), tier=0
-    await (await mock.set(10_000_000_000, 0)).wait();
-    console.log("MockL1Read:", l1readAddr);
-  } else {
-    const fromEnv = process.env.L1READ_ADDR;
-    if (!fromEnv) throw new Error("Missing L1READ_ADDR in env for non-local deploy");
-    l1readAddr = fromEnv;
-  }
-
-  // ---------- 2) Deploy MirrorState ----------
-  const MirrorState = await ethers.getContractFactory("MirrorState");
-  const mirrorState = await MirrorState.deploy(deployer.address, l1readAddr, assetIndex);
-  await mirrorState.waitForDeployment();
-  const mirrorAddr = await mirrorState.getAddress();
-  console.log("MirrorState:", mirrorAddr);
-
-  // ---------- 3) Deploy tokens ----------
-  let baseAddr: string;
-  let quoteAddr: string;
+  let l1read: Addr | undefined;
+  let mirrorState: Addr | undefined;
+  let base: Addr | undefined;
+  let quote: Addr | undefined;
+  let amm: Addr | undefined;
 
   if (isLocal) {
-    const MockERC20 = await ethers.getContractFactory("MockERC20");
+    // 1) MockL1Read
+    const mockL1 = await deployFromArtifact("MockL1Read", []);
+    l1read = await mockL1.getAddress();
+    console.log("MockL1Read:", l1read);
 
-    const baseDep = await MockERC20.deploy("Mock Base", "mBASE", 18);
-    await baseDep.waitForDeployment();
-    baseAddr = await baseDep.getAddress();
+    // Call set via signature to avoid TS type errors
+    // set(uint64,uint64) or set(uint256,uint256) — either way works with bigint values
+    const setFn =
+      (mockL1 as any)["set(uint256,uint256)"] ??
+      (mockL1 as any)["set(uint64,uint64)"] ??
+      (mockL1 as any).set;
 
-    const quoteDep = await MockERC20.deploy("Mock Quote", "mQUOTE", 6);
-    await quoteDep.waitForDeployment();
-    quoteAddr = await quoteDep.getAddress();
+    if (!setFn) throw new Error("MockL1Read has no set() function in ABI?");
+    await (await setFn(100000000000n, 0n)).wait(); // 1000 * 1e8
+    // 2) MirrorState: MUST match your constructor.
+    const mirrorArtifact = await artifacts.readArtifact("MirrorState");
+    const ctorInputs = constructorInputsFromAbi(mirrorArtifact.abi);
 
-    console.log("Mock base:", baseAddr);
-    console.log("Mock quote:", quoteAddr);
-
-    const base = await ethers.getContractAt("MockERC20", baseAddr);
-    const quote = await ethers.getContractAt("MockERC20", quoteAddr);
-
-    await (await base.mint(deployer.address, ethers.parseUnits("1000000", 18))).wait();
-    await (await quote.mint(deployer.address, ethers.parseUnits("1000000", 6))).wait();
-    console.log("Minted tokens to deployer");
-  } else {
-    const b = process.env.BASE_TOKEN;
-    const q = process.env.QUOTE_TOKEN;
-    if (!b || !q) throw new Error("Missing BASE_TOKEN or QUOTE_TOKEN in env");
-    baseAddr = b;
-    quoteAddr = q;
-  }
-
-  // ---------- 4) Deploy MirrorAMM ----------
-  const MirrorAMM = await ethers.getContractFactory("MirrorAMM");
-  const amm = await MirrorAMM.deploy(baseAddr, quoteAddr, mirrorAddr);
-  await amm.waitForDeployment();
-  const ammAddr = await amm.getAddress();
-  console.log("MirrorAMM:", ammAddr);
-
-  // ---------- 5) Deploy InstantonAllocator ----------
-  const InstantonAllocator = await ethers.getContractFactory("InstantonAllocator");
-  const allocator = await InstantonAllocator.deploy(deployer.address, mirrorAddr, ammAddr);
-  await allocator.waitForDeployment();
-  const allocAddr = await allocator.getAddress();
-  console.log("InstantonAllocator:", allocAddr);
-
-  // ---------- 6) Grant roles ----------
-  // Prefer reading the role constant from the contract if it exists; otherwise fallback.
-  let keeperRole: string;
-  try {
-    // many AccessControl contracts expose KEEPER_ROLE() as a public constant
-    keeperRole = await (mirrorState as any).KEEPER_ROLE();
-  } catch {
-    keeperRole = ethers.keccak256(ethers.toUtf8Bytes("KEEPER_ROLE"));
-  }
-
-  await (await mirrorState.grantRole(keeperRole, deployer.address)).wait();
-  await (await allocator.grantRole(keeperRole, deployer.address)).wait();
-
-  const hasKeeper = await mirrorState.hasRole(keeperRole, deployer.address);
-  console.log("Granted KEEPER_ROLE to deployer:", hasKeeper);
-
-  // ---------- 7) Push initial oracle update + approvals + trigger ----------
-  if (isLocal) {
-    // pRef is WAD (1e18). We'll set pRef = 100
-    const pRef = 100n * 10n ** 18n;
-
-    // IMPORTANT: c should be ln(pRef_unscaled), per your paper.
-    // If pRef = 100, then c = ln(100).
-    const c = lnWad(100);
-
-    // lambda=0.01, s=0.001
-    const theta = {
-      c,                  // ln(100) * 1e18
-      lambda: 10n ** 16n, // 0.01e18
-      s: 10n ** 15n,      // 0.001e18
-    };
-
-    const latestBlock = await ethers.provider.getBlock("latest");
-if (!latestBlock) throw new Error("Could not fetch latest block");
-const now = BigInt(latestBlock.timestamp);
-
-
-    const update = {
-      pRef,
-      theta,
-      sigma: 2n * 10n ** 16n, // 0.02e18
-      imbalance: 0n,
-      timestamp: now,
-    };
-
-    // Preflight to surface revert reasons when possible
-    try {
-      await (mirrorState as any).pushUpdate.staticCall(update);
-    } catch (e) {
-      console.error("pushUpdate.staticCall failed (this is the real revert reason if shown):");
-      console.error(e);
-      throw e;
+    let mirrorArgs = parseJsonArrayEnv("MIRRORSTATE_CTOR_ARGS");
+    if (!mirrorArgs) {
+      // Print help and stop with an actionable message
+      printMirrorCtorHelp(ctorInputs, l1read, deployer.address);
+      throw new Error(
+        `MirrorState constructor needs ${ctorInputs.length} args. ` +
+          `Set MIRRORSTATE_CTOR_ARGS (JSON array) and rerun.`
+      );
     }
 
-    await (await (mirrorState as any).pushUpdate(update)).wait();
-    console.log("Pushed initial oracle update");
+    // Replace placeholders
+    mirrorArgs = mirrorArgs.map((x) => {
+      if (x === "$L1READ") return l1read;
+      if (x === "$DEPLOYER") return deployer.address;
+      return x;
+    });
 
-    const base = await ethers.getContractAt("MockERC20", baseAddr);
-    const quote = await ethers.getContractAt("MockERC20", quoteAddr);
+    let mirror: any;
+    try {
+      mirror = await deployFromArtifact("MirrorState", mirrorArgs);
+    } catch (e: any) {
+      console.log("\n❌ MirrorState deploy failed with your args.");
+      console.log("MIRRORSTATE_CTOR_ARGS:", JSON.stringify(mirrorArgs));
+      console.log("Constructor inputs (ABI):", ctorInputs);
+      throw new Error(e.message);
+    }
 
-    await (await base.approve(ammAddr, ethers.MaxUint256)).wait();
-    await (await quote.approve(ammAddr, ethers.MaxUint256)).wait();
-    console.log("Approved AMM to spend deployer tokens");
+    mirrorState = await mirror.getAddress();
+    console.log("MirrorState:", mirrorState);
 
-    const tx = await allocator.trigger();
-    const rcpt = await tx.wait();
-    console.log("Allocator trigger mined. logs:", rcpt?.logs.length ?? 0);
+    // 3) MockERC20 base/quote
+    // Use env if needed; else try the common pattern (name,symbol,decimals)
+    let baseArgs = parseJsonArrayEnv("MOCKERC20_CTOR_ARGS_BASE") ?? ["Mock Base", "BASE", 18];
+    let quoteArgs = parseJsonArrayEnv("MOCKERC20_CTOR_ARGS_QUOTE") ?? ["Mock Quote", "QUOTE", 18];
+
+    let baseToken: any;
+    let quoteToken: any;
+    try {
+      baseToken = await deployFromArtifact("MockERC20", baseArgs);
+    } catch (e: any) {
+      throw new Error(
+        `Failed deploying MockERC20 base with args=${JSON.stringify(baseArgs)}.\n` +
+          `Set MOCKERC20_CTOR_ARGS_BASE='[...]' to match your MockERC20 constructor.\n` +
+          `Original error:\n${e.message}`
+      );
+    }
+    try {
+      quoteToken = await deployFromArtifact("MockERC20", quoteArgs);
+    } catch (e: any) {
+      throw new Error(
+        `Failed deploying MockERC20 quote with args=${JSON.stringify(quoteArgs)}.\n` +
+          `Set MOCKERC20_CTOR_ARGS_QUOTE='[...]' to match your MockERC20 constructor.\n` +
+          `Original error:\n${e.message}`
+      );
+    }
+
+    base = await baseToken.getAddress();
+    quote = await quoteToken.getAddress();
+    console.log("Mock base:", base);
+    console.log("Mock quote:", quote);
+
+    // 4) Mint tokens to deployer (mint(address,uint256) OR mint(uint256))
+    const mintAmt = 1_000_000n * 10n ** 18n;
+
+    const mintAddrFn =
+      (baseToken as any)["mint(address,uint256)"] ??
+      (baseToken as any).mint;
+
+    try {
+      if ((baseToken as any)["mint(address,uint256)"]) {
+        await (await (baseToken as any)["mint(address,uint256)"](deployer.address, mintAmt)).wait();
+        await (await (quoteToken as any)["mint(address,uint256)"](deployer.address, mintAmt)).wait();
+      } else {
+        await (await (baseToken as any).mint(mintAmt)).wait();
+        await (await (quoteToken as any).mint(mintAmt)).wait();
+      }
+      console.log("Minted tokens to deployer");
+    } catch {
+      console.log("⚠️ Mint skipped (your MockERC20 may not expose mint). That’s okay if balances exist.");
+    }
+
+    // 5) MirrorAMM(base, quote, mirror)
+    const ammC = await deployFromArtifact("MirrorAMM", [base, quote, mirrorState]);
+    amm = await ammC.getAddress();
+    console.log("MirrorAMM:", amm);
+
+    // 6) YieldVaultMock(quote, admin)
+    const vault = await deployFromArtifact("YieldVaultMock", [quote, deployer.address]);
+    const vaultAddr = await vault.getAddress();
+    console.log("YieldVaultMock:", vaultAddr);
+
+    // 7) InstantonAllocator(amm, mirror, base, quote, vault, admin)
+    const alloc = await deployFromArtifact("InstantonAllocator", [
+      amm,
+      mirrorState,
+      base,
+      quote,
+      vaultAddr,
+      deployer.address
+    ]);
+    const allocAddr = await alloc.getAddress();
+    console.log("InstantonAllocator:", allocAddr);
+
+    // Roles (call via signature to silence TS)
+    const keeperRole =
+      (alloc as any)["KEEPER_ROLE()"] ? await (alloc as any)["KEEPER_ROLE()"]() : await (alloc as any).KEEPER_ROLE();
+    await (await (alloc as any)["grantRole(bytes32,address)"](keeperRole, deployer.address)).wait();
+    const hasKeeper = await (alloc as any)["hasRole(bytes32,address)"](keeperRole, deployer.address);
+    console.log("Granted KEEPER_ROLE to deployer:", hasKeeper);
+
+    const managerRole =
+      (vault as any)["MANAGER_ROLE()"] ? await (vault as any)["MANAGER_ROLE()"]() : await (vault as any).MANAGER_ROLE();
+    await (await (vault as any)["grantRole(bytes32,address)"](managerRole, allocAddr)).wait();
+    const hasManager = await (vault as any)["hasRole(bytes32,address)"](managerRole, allocAddr);
+    console.log("Granted MANAGER_ROLE to allocator:", hasManager);
+
+    // Save deployments
+    writeDeployments({
+      chainId,
+      deployer: deployer.address,
+      MockL1Read: l1read,
+      MirrorState: mirrorState,
+      BaseToken: base,
+      QuoteToken: quote,
+      MirrorAMM: amm,
+      YieldVaultMock: vaultAddr,
+      InstantonAllocator: allocAddr
+    });
+
+    console.log("Deploy complete ✅");
+    console.log("\nNext:");
+    console.log("  npx hardhat run scripts/02-oracle-lifecycle.ts --network localhost");
+    console.log("  npx hardhat run scripts/03-amm-swap.ts --network localhost");
+    console.log("  npx hardhat run scripts/04-instanton-trigger.ts --network localhost");
+    return;
   }
 
-  console.log("Done.");
+  throw new Error("This deploy script is intended for localhost/hardhat mode right now.");
 }
 
 main().catch((e) => {
