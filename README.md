@@ -256,25 +256,6 @@ That's what we call an **instanton**.
 
 ---
 
-## Repo Structure
-
-```
-contracts/
-├── MirrorState.sol         # Canonical liquidity state
-├── MirrorAMM.sol           # Continuous pricing
-└── InstantonAllocator.sol  # Threshold-based capital jumps
-
-scripts/
-├── deploy/                 # Deployment scripts
-├── oracle/                 # Oracle lifecycle management
-└── demos/                  # AMM swap demonstrations
-
-paper/
-└── mirror_symmetric_amm.tex  # Full formal writeup
-```
-
----
-
 ## Key Contracts
 
 ### MirrorState.sol
@@ -323,29 +304,9 @@ All risk parameters have hard limits that cannot be exceeded by keepers or strat
 
 ---
 
-## One-Paragraph Summary
+## Summary
 
 This protocol treats liquidity as something that can be described in two equivalent ways: as a smooth pricing function or as discrete limit orders. Most systems pick one. Hyperliquid allows both. We keep a single canonical liquidity state, express it continuously when markets are calm, and switch to discrete execution when conditions demand it. The switch itself is not gradual—it happens when a threshold is crossed. That dual description, and the discrete jumps between them, is what we mean by "mirror symmetry plus instantons."
 
 ---
 
-## Getting Started
-
-```bash
-# Clone the repo
-git clone <repo-url>
-cd mirror-instanton-amm
-
-# Install dependencies
-npm install
-
-# Deploy contracts (testnet)
-npx hardhat run scripts/deploy/deploy.js --network hyperliquid-testnet
-
-# Run keeper
-node scripts/oracle/keeper.js
-```
-
----
-
-[TODO]
