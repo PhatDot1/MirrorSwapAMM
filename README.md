@@ -204,9 +204,9 @@ That's what we call an **instanton**.
 
 ### What We Explicitly Do NOT Claim
 
-❌ No real Calabi–Yau geometry  
-❌ No path integrals  
-❌ No literal physics  
+- No real Calabi–Yau geometry
+- No path integrals
+- No literal physics
 
 **This is mechanism design, using physics language as a structuring metaphor, not as math.**
 

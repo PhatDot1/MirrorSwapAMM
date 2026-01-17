@@ -89,8 +89,7 @@ contract MirrorState is AccessControl {
     }
 
     /// @notice Pull live oracle price (WAD).
-    /// @dev For Hardhat mock we assume price is 1e8 and convert to 1e18.
-    /// For real HyperEVM deployment, update scaling to match official docs. 
+    /// @dev Hardhat mock assumes price is 1e8 and converts to 1e18. Real deploy: fix scaling.
     function livePriceWad() public view returns (int256) {
         (uint64 price,) = l1read.perpOraclePrice(assetIndex);
         return int256(uint256(price)) * 1e10; // 1e8 -> 1e18

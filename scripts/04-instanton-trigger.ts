@@ -44,7 +44,7 @@ async function main() {
   const amm = new ethers.Contract(dep.MirrorAMM, ammAbi, deployer);
   const allocator = new ethers.Contract(dep.InstantonAllocator, allocAbi, deployer);
 
-  // ---- Snapshot state before
+  // snapshot
   const tierInfo = await mirror.oracleTier();
   const tier: bigint = tierInfo[1];
   const emergencyStale: boolean = tierInfo[3];
@@ -53,7 +53,7 @@ async function main() {
   const theta = await mirror.theta();
   const qWad: bigint = await amm.qWad();
 
-  console.log("\n=== Pre-trigger snapshot ===");
+  console.log("\npre-trigger");
   console.log("oracle tier:", tier.toString(), "emergencyStale:", emergencyStale);
   console.log("pRef:", fmt18(pRef));
   console.log("theta.c:", fmt18(theta[0] as bigint));
@@ -61,21 +61,21 @@ async function main() {
   console.log("theta.s:", fmt18(theta[2] as bigint));
   console.log("AMM qWad:", fmt18(qWad));
 
-  // ---- Trigger
-  console.log("\n--- Calling InstantonAllocator.trigger() ---");
+  // trigger
+  console.log("\ncalling allocator.trigger()");
   const tx = await allocator.trigger();
   const rc = await tx.wait();
   console.log("trigger tx:", rc.hash);
 
-  // ---- Print logs in a robust way (even if we don't know event names)
-  console.log("\n=== Allocator logs ===");
+  // allocator logs
+  console.log("\nallocator logs");
   let printed = 0;
 
   for (const log of rc.logs) {
     try {
       const parsed = allocator.interface.parseLog(log);
-      console.log(`- Event: ${parsed.name}`);
-      // pretty print args
+      console.log(`event: ${parsed.name}`);
+      // args
       const obj: any = {};
       for (const [k, v] of Object.entries(parsed.args)) {
         if (!isNaN(Number(k))) continue; // skip numeric indexes
@@ -84,20 +84,19 @@ async function main() {
       console.log(obj);
       printed++;
     } catch {
-      // not an allocator event
+      // not ours
     }
   }
 
   if (printed === 0) {
-    console.log("(No allocator events decoded — that's okay. Your trigger() may not emit yet.)");
-    console.log("If you want, we can add an explicit Decision(...) event in the contract.");
+    console.log("(no allocator events decoded)");
   }
 
-  // ---- Post snapshot
+  // post
   const qAfter: bigint = await amm.qWad();
-  console.log("\n=== Post-trigger snapshot ===");
+  console.log("\npost-trigger");
   console.log("AMM qWad:", fmt18(qAfter));
-  console.log("\nStep 4 complete ✅");
+  console.log("\ndone");
 }
 
 main().catch((e) => {

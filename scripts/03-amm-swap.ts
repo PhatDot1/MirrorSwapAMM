@@ -30,7 +30,7 @@ async function safeCall<T>(label: string, fn: () => Promise<T>): Promise<T> {
   try {
     return await fn();
   } catch (e: any) {
-    console.error(`\n❌ Reverted during: ${label}`);
+    console.error(`\nreverted during: ${label}`);
     console.error(e?.shortMessage ?? e?.message ?? e);
     throw e;
   }
@@ -60,13 +60,11 @@ async function main() {
   const base = new ethers.Contract(baseAddr, erc20Abi, deployer);
   const quote = new ethers.Contract(quoteAddr, erc20Abi, deployer);
 
-  // -------------------------
-  // 0) Oracle refresh
-  // -------------------------
+  // oracle refresh
   const price1e8 = 2100n * 10n ** 8n;
   const conf1e8 = 0n;
 
-  console.log("\n=== Oracle refresh ===");
+  console.log("\nOracle refresh");
   await (await l1read.set(price1e8, conf1e8)).wait();
   console.log("MockL1Read set price (1e8):", price1e8.toString());
 
@@ -98,14 +96,14 @@ async function main() {
   // snapshots
   const pRef: bigint = await mirror.pRef();
   const theta = await mirror.theta();
-  console.log("\n=== MirrorState ===");
+  console.log("\nMirrorState");
   console.log("pRef (1e18):", fmt18(pRef));
   console.log("theta.c:", fmt18(theta[0] as bigint));
   console.log("theta.lambda:", fmt18(theta[1] as bigint));
   console.log("theta.s:", fmt18(theta[2] as bigint));
 
   const q0: bigint = await amm.qWad();
-  console.log("\n=== AMM params ===");
+  console.log("\nAMM params");
   console.log("qWad:", fmt18(q0));
   console.log("etaWad:", fmt18((await amm.etaWad()) as bigint));
   console.log("qMaxWad:", fmt18((await amm.qMaxWad()) as bigint));
@@ -113,16 +111,14 @@ async function main() {
   console.log("base token:", baseAddr);
   console.log("quote token:", quoteAddr);
 
-  // -------------------------
-  // 1) Ensure deployer has enough balances (fresh redeploy-safe)
-  // -------------------------
+  // make sure deployer has balances (fresh redeploy-safe)
   const seedBase = ethers.parseUnits("10", 18);
   const seedQuote = ethers.parseUnits("25000", 18);
 
   const sellBaseIn = ethers.parseUnits("0.01", 18);
   const buyBaseOut = ethers.parseUnits("0.005", 18);
 
-  // rough extra quote buffer for BUY (overkill but fine for demo)
+  // extra quote buffer for BUY
   const extraQuoteBuffer = ethers.parseUnits("10000", 18);
 
   const wantBase = seedBase + sellBaseIn; // enough to seed and sell
@@ -131,50 +127,48 @@ async function main() {
   let traderBase: bigint = await base.balanceOf(deployer.address);
   let traderQuote: bigint = await quote.balanceOf(deployer.address);
 
-  console.log("\n=== Trader balances (before) ===");
+  console.log("\nTrader balances (before)");
   console.log("base:", fmt18(traderBase));
   console.log("quote:", fmt18(traderQuote));
 
   if (traderBase < wantBase) {
     const missing = wantBase - traderBase;
-    console.log(`\n🪙 Minting BASE to deployer (missing ${fmt18(missing)})...`);
+    console.log(`\nMinting BASE (missing ${fmt18(missing)})...`);
     await (await base.mint(deployer.address, missing)).wait();
   }
 
   traderBase = await base.balanceOf(deployer.address);
   if (traderQuote < wantQuote) {
     const missing = wantQuote - traderQuote;
-    console.log(`\n🪙 Minting QUOTE to deployer (missing ${fmt18(missing)})...`);
+    console.log(`\nMinting QUOTE (missing ${fmt18(missing)})...`);
     await (await quote.mint(deployer.address, missing)).wait();
   }
 
   traderBase = await base.balanceOf(deployer.address);
   traderQuote = await quote.balanceOf(deployer.address);
 
-  console.log("\n=== Trader balances (after mint) ===");
+  console.log("\nTrader balances (after mint)");
   console.log("base:", fmt18(traderBase));
   console.log("quote:", fmt18(traderQuote));
 
-  // -------------------------
-  // 2) Seed AMM if needed
-  // -------------------------
+  // seed AMM if needed
   const ammBaseBal: bigint = await base.balanceOf(dep.MirrorAMM);
   const ammQuoteBal: bigint = await quote.balanceOf(dep.MirrorAMM);
 
-  console.log("\n=== AMM balances (before seed) ===");
+  console.log("\nAMM balances (before seed)");
   console.log("AMM base:", fmt18(ammBaseBal));
   console.log("AMM quote:", fmt18(ammQuoteBal));
 
   if (ammBaseBal < seedBase) {
-    console.log("\n💧 Seeding AMM with BASE...");
+    console.log("\nSeeding AMM with BASE...");
     await (await base.transfer(dep.MirrorAMM, seedBase - ammBaseBal)).wait();
   }
   if (ammQuoteBal < seedQuote) {
-    console.log("\n💧 Seeding AMM with QUOTE...");
+    console.log("\nSeeding AMM with QUOTE...");
     await (await quote.transfer(dep.MirrorAMM, seedQuote - ammQuoteBal)).wait();
   }
 
-  console.log("\n=== AMM balances (after seed) ===");
+  console.log("\nAMM balances (after seed)");
   console.log("AMM base:", fmt18(await base.balanceOf(dep.MirrorAMM)));
   console.log("AMM quote:", fmt18(await quote.balanceOf(dep.MirrorAMM)));
 
@@ -182,39 +176,35 @@ async function main() {
   await (await base.approve(dep.MirrorAMM, ethers.MaxUint256)).wait();
   await (await quote.approve(dep.MirrorAMM, ethers.MaxUint256)).wait();
 
-  // -------------------------
-  // 3) Quote + swap SELL
-  // -------------------------
+  // quote + swap SELL
   const sellQuoteOutWad: bigint = await safeCall("quoteForBaseDelta(SELL)", async () => {
     return (await amm.quoteForBaseDelta(false, BigInt(sellBaseIn))) as bigint;
   });
 
-  console.log("\n=== Quote (SELL) ===");
+  console.log("\nQuote (SELL)");
   console.log("Sell base in:", fmt18(sellBaseIn));
   console.log("Expected quote out (wad):", fmt18(sellQuoteOutWad));
 
-  console.log("\n--- Executing SELL ---");
+  console.log("\nExecuting SELL");
   await (await amm.swapSellBaseExactIn(sellBaseIn)).wait();
-  console.log("SELL mined ✅");
+  console.log("SELL mined");
 
-  // -------------------------
-  // 4) Quote + swap BUY
-  // -------------------------
+  // quote + swap BUY
   const buyQuoteInWad: bigint = await safeCall("quoteForBaseDelta(BUY)", async () => {
     return (await amm.quoteForBaseDelta(true, BigInt(buyBaseOut))) as bigint;
   });
 
-  console.log("\n=== Quote (BUY) ===");
+  console.log("\nQuote (BUY)");
   console.log("Buy base out:", fmt18(buyBaseOut));
   console.log("Expected quote in (wad):", fmt18(buyQuoteInWad));
 
-  console.log("\n--- Executing BUY ---");
+  console.log("\nExecuting BUY");
   await (await amm.swapBuyBaseExactOut(buyBaseOut)).wait();
-  console.log("BUY mined ✅");
+  console.log("BUY mined");
 
   const qEnd: bigint = await amm.qWad();
-  console.log("\n=== Final qWad ===", fmt18(qEnd));
-  console.log("\nStep 3 complete ✅");
+  console.log("\nFinal qWad:", fmt18(qEnd));
+  console.log("\ndone");
 }
 
 main().catch((e) => {

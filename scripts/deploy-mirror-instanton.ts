@@ -11,7 +11,7 @@ function writeDeployments(obj: any) {
   ensureDir("deployments");
   const path = `deployments/${network.name}.json`;
   fs.writeFileSync(path, JSON.stringify(obj, null, 2));
-  console.log("Wrote:", path);
+  console.log("deployments:", path);
 }
 
 function parseJsonArrayEnv(name: string): any[] | null {
@@ -41,11 +41,10 @@ function constructorInputsFromAbi(abi: any[]): { name: string; type: string }[] 
 }
 
 function printMirrorCtorHelp(inputs: { name: string; type: string }[], l1read: string, deployer: string) {
-  console.log("\n=== MirrorState constructor inputs (from ABI) ===");
+  console.log("\nMirrorState constructor inputs (ABI)");
   inputs.forEach((i, idx) => console.log(`  [${idx}] ${i.name || "(unnamed)"} : ${i.type}`));
 
-  // Provide a “best effort” template the user can edit.
-  // We'll fill obvious addresses.
+  // template values
   const template = inputs.map((i) => {
     if (i.type === "address") return "$L1READ"; // user can replace some with deployer if needed
     if (i.type.startsWith("uint") || i.type.startsWith("int")) return 3600;
@@ -55,13 +54,13 @@ function printMirrorCtorHelp(inputs: { name: string; type: string }[], l1read: s
     return null;
   });
 
-  console.log("\nSet this env var (edit values as needed):");
+  console.log("\nset env var:");
   console.log(
     `export MIRRORSTATE_CTOR_ARGS='${JSON.stringify(template)}'`
   );
-  console.log(`Then replace "$L1READ" placeholders with the right addresses. Commonly:`);
-  console.log(`- oracle/precompile address -> "$L1READ" (${l1read})`);
-  console.log(`- admin/owner -> "${deployer}"`);
+  console.log(`replace placeholders:`);
+  console.log(`- $L1READ -> ${l1read}`);
+  console.log(`- $DEPLOYER -> ${deployer}`);
   console.log("");
 }
 
@@ -86,8 +85,7 @@ async function main() {
     l1read = await mockL1.getAddress();
     console.log("MockL1Read:", l1read);
 
-    // Call set via signature to avoid TS type errors
-    // set(uint64,uint64) or set(uint256,uint256) — either way works with bigint values
+    // pick set() overload
     const setFn =
       (mockL1 as any)["set(uint256,uint256)"] ??
       (mockL1 as any)["set(uint64,uint64)"] ??
@@ -95,13 +93,12 @@ async function main() {
 
     if (!setFn) throw new Error("MockL1Read has no set() function in ABI?");
     await (await setFn(100000000000n, 0n)).wait(); // 1000 * 1e8
-    // 2) MirrorState: MUST match your constructor.
+    // 2) MirrorState: args must match constructor
     const mirrorArtifact = await artifacts.readArtifact("MirrorState");
     const ctorInputs = constructorInputsFromAbi(mirrorArtifact.abi);
 
     let mirrorArgs = parseJsonArrayEnv("MIRRORSTATE_CTOR_ARGS");
     if (!mirrorArgs) {
-      // Print help and stop with an actionable message
       printMirrorCtorHelp(ctorInputs, l1read, deployer.address);
       throw new Error(
         `MirrorState constructor needs ${ctorInputs.length} args. ` +
@@ -120,7 +117,7 @@ async function main() {
     try {
       mirror = await deployFromArtifact("MirrorState", mirrorArgs);
     } catch (e: any) {
-      console.log("\n❌ MirrorState deploy failed with your args.");
+      console.log("\nMirrorState deploy failed with your args");
       console.log("MIRRORSTATE_CTOR_ARGS:", JSON.stringify(mirrorArgs));
       console.log("Constructor inputs (ABI):", ctorInputs);
       throw new Error(e.message);
@@ -177,7 +174,7 @@ async function main() {
       }
       console.log("Minted tokens to deployer");
     } catch {
-      console.log("⚠️ Mint skipped (your MockERC20 may not expose mint). That’s okay if balances exist.");
+      console.log("Mint skipped (MockERC20 might not expose mint)");
     }
 
     // 5) MirrorAMM(base, quote, mirror)
@@ -228,8 +225,8 @@ async function main() {
       InstantonAllocator: allocAddr
     });
 
-    console.log("Deploy complete ✅");
-    console.log("\nNext:");
+    console.log("deploy done");
+    console.log("\nnext:");
     console.log("  npx hardhat run scripts/02-oracle-lifecycle.ts --network localhost");
     console.log("  npx hardhat run scripts/03-amm-swap.ts --network localhost");
     console.log("  npx hardhat run scripts/04-instanton-trigger.ts --network localhost");

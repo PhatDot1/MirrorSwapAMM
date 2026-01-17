@@ -5,15 +5,13 @@ import {IERC20} from "./interfaces/IERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 
-/// @notice Minimal "yield module" mock.
-/// - Only supports a single underlying asset: QUOTE token
-/// - Tracks shares 1:1 for simplicity (plus optional yield factor)
+/// Tiny yield vault mock. Single asset (quote). Shares are 1:1, plus rateWad.
 contract YieldVaultMock is ReentrancyGuard, AccessControl {
     bytes32 public constant MANAGER_ROLE = keccak256("MANAGER_ROLE");
 
     IERC20 public immutable quote;
 
-    // Simple yield multiplier (WAD). 1e18 = no yield.
+    // yield multiplier (WAD). 1e18 = no yield.
     int256 public rateWad = 1e18;
 
     mapping(address => uint256) public shares;
@@ -36,16 +34,15 @@ contract YieldVaultMock is ReentrancyGuard, AccessControl {
 
     function totalUnderlyingFor(address user) public view returns (uint256) {
         // shares * rateWad
-        // shares are in underlying units already; multiply by rate
         return uint256((int256(shares[user]) * rateWad) / 1e18);
     }
 
     function depositFor(address user, uint256 amount) external nonReentrant onlyRole(MANAGER_ROLE) returns (uint256 mintedShares) {
         require(amount > 0, "amount=0");
-        // pull quote from caller (allocator)
+        // pull quote from caller
         require(quote.transferFrom(msg.sender, address(this), amount), "transferFrom fail");
 
-        // 1:1 shares minted (simple)
+        // 1:1 shares
         mintedShares = amount;
         shares[user] += mintedShares;
 
@@ -57,7 +54,6 @@ contract YieldVaultMock is ReentrancyGuard, AccessControl {
         uint256 underlying = totalUnderlyingFor(user);
         require(amount <= underlying, "insufficient underlying");
 
-        // burn proportional shares (simple approximation)
         // burnedShares = amount / rate
         burnedShares = uint256((int256(amount) * 1e18) / rateWad);
         require(burnedShares <= shares[user], "burn>shares");
